@@ -2,6 +2,7 @@
 /// private closure. These tables contain roots, identities and continuations.
 /// The actor* frontend will eventually generate receive/resume code; the initial
 /// fixture supplies it explicitly. This is not yet a public language feature.
+import LocalId "LocalId";
 import Nat64 "mo:core/Nat64";
 import Runtime "mo:core/Runtime";
 import VarArray "mo:core/VarArray";
@@ -46,6 +47,12 @@ module {
   type Pending = { identity : Continuation; resume : Reply -> Step; cleanup : ?(() -> ()); var prev : ?Nat; var next : ?Nat };
 
   public class Kernel(container : Principal, capacity : Nat, continuationCapacity : Nat) {
+    /// Pure reference construction: validation and canonical owner binding only.
+    public func referenceComputation(owner : ?Principal, id : Principal) : Ref {
+      let ?parts=LocalId.decode(id) else Runtime.trap("invalid actor* local ID");
+      {container=switch(owner){case null container;case(?explicit) explicit};
+       slot=parts.slot;generation=parts.generation}
+    };
     let actors = VarArray.repeat<?Entry>(null, capacity);
     let generations = VarArray.repeat<Nat64>(1, capacity);
     // Bounded retirement evidence: one high-water generation per registry slot.
