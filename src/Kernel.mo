@@ -32,7 +32,12 @@ module {
   public type Context = { self : Ref; caller : Caller };
   public type ContextActor = { receive : (Context, Text, Blob) -> Step };
   public type RootContextActor = {receive : (Context,Text,Blob) -> Step; receiveRoot : (Context,Nat64,Nat64) -> Step};
-  type Receiver = { receive : (?Caller, Text, Blob) -> Step; root : ?((Caller,Nat64,Nat64) -> Step) };
+  /// Compiler-private type erasure. Only the compiler may supply a signature
+  /// and reconstitute a closure after resolveComputation validates it. This is
+  /// not a source-level dynamic cast or a serializable method representation.
+  public type ComputationMethod = { name : Text; signature : Text; value : Any };
+  public type ComputationStorage = { methods : [ComputationMethod] };
+  type Receiver = { receive : (?Caller, Text, Blob) -> Step; root : ?((Caller,Nat64,Nat64) -> Step); computations : ?ComputationStorage };
   type Entry = { identity : Ref; instance : Receiver; var queries : ?[Text]; var pending : ?Nat };
   type Pending = { identity : Continuation; resume : Reply -> Step; cleanup : ?(() -> ()); var prev : ?Nat; var next : ?Nat };
 
@@ -119,13 +124,13 @@ module {
     public func spawn(make : Ref -> Actor) : Ref {
       allocate(func id {
         let instance = make(id);
-        { root = null; receive = func (_caller : ?Caller, method : Text, arg : Blob) : Step { instance.receive(method, arg) } };
+        { root = null; computations = null; receive = func (_caller : ?Caller, method : Text, arg : Blob) : Step { instance.receive(method, arg) } };
       });
     };
     public func spawnContext(make : Ref -> ContextActor) : Ref {
       allocate(func id {
         let instance = make(id);
-        { root = null; receive = func (caller : ?Caller, method : Text, arg : Blob) : Step {
+        { root = null; computations = null; receive = func (caller : ?Caller, method : Text, arg : Blob) : Step {
           let source = switch caller {
             case (?value) value;
             case null Runtime.trap("local caller context required");
@@ -138,7 +143,7 @@ module {
     public func spawnRootContext(make : Ref -> RootContextActor) : Ref {
       allocate(func id {
         let instance=make(id);
-        {receive=func(caller : ?Caller,method : Text,arg : Blob) : Step {
+        {computations=null;receive=func(caller : ?Caller,method : Text,arg : Blob) : Step {
           let ?source=caller else Runtime.trap("local caller context required");
           instance.receive({self=id;caller=source},method,arg)
         };
@@ -146,6 +151,45 @@ module {
           instance.receiveRoot({self=id;caller},slot,generation)
         })}
       })
+    };
+    /// Shares identity allocation and retirement with queued actors, but never
+    /// installs a queued receiver. Factory execution is synchronous. Its private
+    /// state is rooted by the registered method closures in this container heap.
+    public func spawnComputation(make : Ref -> ComputationStorage) : Ref {
+      allocate(func id {
+        let storage = make(id);
+        // Reject ambiguous compiler tables before publishing the identity.
+        var i = 0;
+        while (i < storage.methods.size()) {
+          let method = storage.methods[i];
+          if (method.name == "" or method.signature == "") Runtime.trap("invalid computation method descriptor");
+          var j = 0;
+          while (j < i) {
+            if (storage.methods[j].name == method.name) Runtime.trap("duplicate computation method");
+            j += 1
+          };
+          i += 1
+        };
+        { computations = ?storage; root = null;
+          receive = func (_caller : ?Caller, _method : Text, _arg : Blob) : Step {
+            Runtime.trap("computation actor requires inline dispatch")
+          }
+        }
+      })
+    };
+    /// Call from INSIDE the deferred computation, on every execution. Resolving
+    /// while building/caching a bound computation would bypass retirement.
+    /// No method invocation, message, continuation allocation or commit occurs.
+    public func resolveComputation(id : Ref, method : Text, signature : Text) : Any {
+      let e = entry(id);
+      let ?storage = e.instance.computations else Runtime.trap("actor lacks computation storage");
+      for (candidate in storage.methods.vals()) {
+        if (candidate.name == method) {
+          if (candidate.signature != signature) Runtime.trap("computation method signature mismatch");
+          return candidate.value
+        }
+      };
+      Runtime.trap("unknown computation method")
     };
     public func dispatchRoot(id : Ref,caller : Caller,slot : Nat64,generation : Nat64) : Frame {
       switch caller {case (#local source) {assert source.container == container};case _ Runtime.trap("rooted request requires local caller")};
