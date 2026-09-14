@@ -37,6 +37,10 @@ module {
   /// not a source-level dynamic cast or a serializable method representation.
   public type ComputationMethod = { name : Text; signature : Text; value : Any };
   public type ComputationStorage = { methods : [ComputationMethod] };
+  /// Trusted ingress provenance. Local provenance is derived from the executing
+  /// frame, never supplied by a bound method or its creator.
+  public type ComputationIngress = { #host; #external : Principal };
+  type ComputationFrame = ?(Nat, Context, ComputationFrame);
   type Receiver = { receive : (?Caller, Text, Blob) -> Step; root : ?((Caller,Nat64,Nat64) -> Step); computations : ?ComputationStorage };
   type Entry = { identity : Ref; instance : Receiver; var queries : ?[Text]; var pending : ?Nat };
   type Pending = { identity : Continuation; resume : Reply -> Step; cleanup : ?(() -> ()); var prev : ?Nat; var next : ?Nat };
@@ -58,6 +62,8 @@ module {
     var pendingCount = 0;
     var retired = List.empty<Ref>();
     var reading = false;
+    var computationFrame : ComputationFrame = null;
+    var computationTicket = 0;
     var scalarRootPublisher : ?((Ref,Ref,Nat64,Nat64) -> ()) = null;
     public func installScalarRequests(publish : (Ref,Ref,Nat64,Nat64) -> ()) {
       assert live == 0 and pendingCount == 0;
@@ -190,6 +196,50 @@ module {
         }
       };
       Runtime.trap("unknown computation method")
+    };
+    /// Compiler-private execution ABI, not a source capability. Enter only
+    /// after deferred receiver/signature resolution, on EVERY evaluation. The
+    /// ingress argument must come from the host/IC execution context, not from
+    /// the source program or a computation's captured creation context.
+    ///
+    /// This stack is container heap state: a trap rolls it back with the whole
+    /// segment. Generated code must leave on normal returns AND caught-language
+    /// error propagation. External suspension is not supported by this ABI;
+    /// continuation save/restore belongs to S31. No message/commit is performed.
+    public func enterComputation(id : Ref, ingress : ComputationIngress) : Nat {
+      let e = entry(id);
+      switch (e.instance.computations) {
+        case null Runtime.trap("actor lacks computation storage");
+        case _ {};
+      };
+      let caller : Caller = switch computationFrame {
+        case (?( _, parent, _)) #local(parent.self);
+        case null switch ingress {
+          case (#host) #host;
+          case (#external principal) #external(principal);
+        };
+      };
+      // A depth or receiver ID alone would allow a stale exit token to pop a
+      // later frame, particularly during A -> B -> A reentry. Never reuse a
+      // ticket within a committed heap history. Trap rollback rolls back both.
+      computationTicket += 1;
+      computationFrame := ?(computationTicket, {self = id; caller}, computationFrame);
+      computationTicket
+    };
+    public func computationContext() : Context {
+      switch computationFrame {
+        case (?( _, context, _)) context;
+        case null Runtime.trap("no executing computation actor");
+      }
+    };
+    public func leaveComputation(ticket : Nat) {
+      switch computationFrame {
+        case (?(current, _, parent)) {
+          if (ticket != current) Runtime.trap("computation frame exit out of order");
+          computationFrame := parent
+        };
+        case null Runtime.trap("no executing computation actor");
+      }
     };
     public func dispatchRoot(id : Ref,caller : Caller,slot : Nat64,generation : Nat64) : Frame {
       switch caller {case (#local source) {assert source.container == container};case _ Runtime.trap("rooted request requires local caller")};
