@@ -1,0 +1,8 @@
+[package]
+name = "mo-local-actors"
+version = "0.0.1"
+description = "Experimental local-actor compiler target and runtime protocol."
+license = "Apache-2.0"
+
+[dependencies]
+core = "2.5.0"
