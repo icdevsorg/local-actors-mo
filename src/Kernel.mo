@@ -71,6 +71,9 @@ module {
     var reading = false;
     var computationFrame : ComputationFrame = null;
     var computationTicket = 0;
+    var computationDepth = 0;
+    // Explicit bound for inline recursion, independent of display/actor count.
+    let computationDepthLimit = 128;
     var scalarRootPublisher : ?((Ref,Ref,Nat64,Nat64) -> ()) = null;
     public func installScalarRequests(publish : (Ref,Ref,Nat64,Nat64) -> ()) {
       assert live == 0 and pendingCount == 0;
@@ -229,6 +232,8 @@ module {
       // A depth or receiver ID alone would allow a stale exit token to pop a
       // later frame, particularly during A -> B -> A reentry. Never reuse a
       // ticket within a committed heap history. Trap rollback rolls back both.
+      if (computationDepth >= computationDepthLimit) Runtime.trap("local computation depth limit exceeded");
+      computationDepth += 1;
       computationTicket += 1;
       computationFrame := ?(computationTicket, {self = id; caller}, computationFrame);
       computationTicket
@@ -239,11 +244,33 @@ module {
         case null Runtime.trap("no executing computation actor");
       }
     };
+    /// Explicit source self-retirement authority, tied to this invocation ticket.
+    /// It cannot retire a sibling or be saved and reused by a later invocation.
+    public func computationRetirementContext() : {self : Ref; caller : Caller; retire : () -> ()} {
+      let ?(ticket, context, _) = computationFrame else Runtime.trap("no executing computation actor");
+      {self=context.self; caller=context.caller; retire=func () {
+        let ?(active, current, parent) = computationFrame else Runtime.trap("no executing computation actor");
+        if(active != ticket or current.self != context.self)
+          Runtime.trap("retirement requires its current computation invocation");
+        var cursor=parent;
+        label scan loop {
+          switch cursor {
+            case null break scan;
+            case(?( _, other, rest)) {
+              if(other.self==current.self) Runtime.trap("local actor retirement is busy");
+              cursor := rest
+            }
+          }
+        };
+        retire(current.self)
+      }}
+    };
     public func leaveComputation(ticket : Nat) {
       switch computationFrame {
         case (?(current, _, parent)) {
           if (ticket != current) Runtime.trap("computation frame exit out of order");
-          computationFrame := parent
+          computationFrame := parent;
+          computationDepth -= 1
         };
         case null Runtime.trap("no executing computation actor");
       }
