@@ -72,6 +72,8 @@ module {
     var computationFrame : ComputationFrame = null;
     var computationTicket = 0;
     var computationDepth = 0;
+    // Parked invocations retain retirement ownership but are not ambient callers.
+    let suspendedComputations = VarArray.repeat<Nat>(0, capacity);
     // Explicit bound for inline recursion, independent of display/actor count.
     let computationDepthLimit = 128;
     var scalarRootPublisher : ?((Ref,Ref,Nat64,Nat64) -> ()) = null;
@@ -214,8 +216,8 @@ module {
     ///
     /// This stack is container heap state: a trap rolls it back with the whole
     /// segment. Generated code must leave on normal returns AND caught-language
-    /// error propagation. External suspension is not supported by this ABI;
-    /// continuation save/restore belongs to S31. No message/commit is performed.
+    /// error propagation. Suspension detaches this stack through suspendComputation below.
+    /// These operations never perform a message or commit themselves.
     public func enterComputation(id : Ref, ingress : ComputationIngress) : Nat {
       let e = entry(id);
       switch (e.instance.computations) {
@@ -237,6 +239,50 @@ module {
       computationTicket += 1;
       computationFrame := ?(computationTicket, {self = id; caller}, computationFrame);
       computationTicket
+    };
+    /// Compiler-only continuation capability. Evaluate the future operand first,
+    /// then park the complete logical stack. The returned restoration must run
+    /// before success, rejection AND trap cleanup. Callback rollback restores
+    /// this closure's unconsumed state, allowing cleanup to restore and unwind
+    /// the original invocation against the latest committed heap.
+    ///
+    /// No world state is captured here, only immutable frame/context metadata.
+    public func suspendComputation() : () -> () {
+      let saved = computationFrame;
+      let depth = computationDepth;
+      var cursor = saved;
+      label validate loop {
+        let ?(_, context, rest) = cursor else break validate;
+        // A retired invocation may unwind, but cannot acquire a new suspension.
+        ignore entry(context.self);
+        cursor := rest
+      };
+      cursor := saved;
+      label park loop {
+        let ?(_, context, rest) = cursor else break park;
+        let slot = Nat64.toNat(context.self.slot);
+        suspendedComputations[slot] += 1;
+        cursor := rest
+      };
+      computationFrame := null;
+      computationDepth := 0;
+      var consumed = false;
+      func () {
+        if (consumed) Runtime.trap("computation suspension already restored");
+        if (computationDepth != 0) Runtime.trap("computation restoration requires an empty stack");
+        var remaining = saved;
+        label restore loop {
+          let ?(_, context, rest) = remaining else break restore;
+          ignore entry(context.self);
+          let slot = Nat64.toNat(context.self.slot);
+          assert suspendedComputations[slot] > 0;
+          suspendedComputations[slot] -= 1;
+          remaining := rest
+        };
+        consumed := true;
+        computationFrame := saved;
+        computationDepth := depth
+      }
     };
     public func computationContext() : Context {
       switch computationFrame {
@@ -310,6 +356,7 @@ module {
     public func retire(id : Ref) {
       if (reading) Runtime.trap("actor retirement is unavailable in a read-only call");
       let e = entry(id);
+      if (suspendedComputations[Nat64.toNat(id.slot)] != 0) Runtime.trap("local actor retirement is busy");
       label clean loop {
         switch (e.pending) {
           case null break clean;
