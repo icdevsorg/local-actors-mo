@@ -223,6 +223,16 @@ module {
     /// segment. Generated code must leave on normal returns AND caught-language
     /// error propagation. Suspension detaches this stack through suspendComputation below.
     /// These operations never perform a message or commit themselves.
+    /// Set only by compiler-generated ordinary query ingress. Query execution
+    /// discards the complete container heap, including this bit, on every exit.
+    public func beginComputationQuery() {
+      if (reading or computationDepth != 0) Runtime.trap("invalid computation query entry");
+      reading := true
+    };
+    public func enterQueryComputation(id : Ref, ingress : ComputationIngress) : Nat {
+      if (not reading) Runtime.trap("actor* query requires an enclosing query");
+      enterComputation(id, ingress)
+    };
     public func enterComputation(id : Ref, ingress : ComputationIngress) : Nat {
       let e = entry(id);
       switch (e.instance.computations) {
