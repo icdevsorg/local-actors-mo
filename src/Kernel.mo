@@ -41,6 +41,9 @@ module {
   /// Trusted ingress provenance. Local provenance is derived from the executing
   /// frame, never supplied by a bound method or its creator.
   public type ComputationIngress = { #host; #external : Principal };
+  /// Compiler-private lease for one independently scheduled ordinary future.
+  public type ComputationTask = { start : () -> (); finish : () -> (); settle : () -> () };
+  type TaskPhase = { #queued; #running : Nat; #finished; #settled };
   type ComputationFrame = ?(Nat, Context, ComputationFrame);
   type Receiver = { receive : (?Caller, Text, Blob) -> Step; root : ?((Caller,Nat64,Nat64) -> Step); computations : ?ComputationStorage };
   type Entry = { identity : Ref; instance : Receiver; var queries : ?[Text]; var pending : ?Nat };
@@ -74,6 +77,8 @@ module {
     var computationDepth = 0;
     // Parked invocations retain retirement ownership but are not ambient callers.
     let suspendedComputations = VarArray.repeat<Nat>(0, capacity);
+    // Creation retains the owner until the independently scheduled body enters.
+    let queuedComputations = VarArray.repeat<Nat>(0, capacity);
     // Explicit bound for inline recursion, independent of display/actor count.
     let computationDepthLimit = 128;
     var scalarRootPublisher : ?((Ref,Ref,Nat64,Nat64) -> ()) = null;
@@ -284,6 +289,58 @@ module {
         computationDepth := depth
       }
     };
+    /// Prepare in the creating segment, before staging the ordinary async send.
+    /// Capture ONLY the immediate owner, never a creator's stack/exit ticket.
+    /// All phase/count changes are heap state and roll back with their segment.
+    ///
+    /// The compiler must settle on send-initiation failure and ordinary future
+    /// settlement, even if the future is ignored. An initial body trap restores
+    /// #queued; its rejection callback releases that hold. A running/suspended
+    /// body must finish through ordinary cleanup before settlement can succeed.
+    /// This ABI alone does not admit private source async bodies.
+    public func prepareComputationTask() : ComputationTask {
+      let ?(_, context, _) = computationFrame else return {
+        start = func () {}; finish = func () {}; settle = func () {}
+      };
+      let owner = context.self;
+      ignore entry(owner);
+      let slot = Nat64.toNat(owner.slot);
+      queuedComputations[slot] += 1;
+      var phase : TaskPhase = #queued;
+      {
+        start = func () {
+          switch phase { case (#queued) {}; case _ Runtime.trap("computation task already started or settled") };
+          if (computationDepth != 0) Runtime.trap("computation task requires an empty stack");
+          let ticket = enterComputation(owner, #host);
+          // This is a new invocation caused by the owning actor, not a replay
+          // of the external caller that originally entered its creator.
+          computationFrame := ?(ticket, {self = owner; caller = #local(owner)}, null);
+          assert queuedComputations[slot] > 0;
+          queuedComputations[slot] -= 1;
+          phase := #running(ticket)
+        };
+        finish = func () {
+          let #running(ticket) = phase else Runtime.trap("computation task is not running");
+          leaveComputation(ticket);
+          phase := #finished
+        };
+        settle = func () {
+          switch phase {
+            case (#queued) {
+              ignore entry(owner);
+              assert queuedComputations[slot] > 0;
+              queuedComputations[slot] -= 1
+            };
+            case (#running _) Runtime.trap("computation task cleanup is incomplete");
+            case (#finished) {};
+            case (#settled) return;
+          };
+          // Finished owners may already have retired/reused their slot. Never
+          // inspect or decrement a replacement's ownership on late settlement.
+          phase := #settled
+        }
+      }
+    };
     public func computationContext() : Context {
       switch computationFrame {
         case (?( _, context, _)) context;
@@ -356,7 +413,7 @@ module {
     public func retire(id : Ref) {
       if (reading) Runtime.trap("actor retirement is unavailable in a read-only call");
       let e = entry(id);
-      if (suspendedComputations[Nat64.toNat(id.slot)] != 0) Runtime.trap("local actor retirement is busy");
+      if (suspendedComputations[Nat64.toNat(id.slot)] != 0 or queuedComputations[Nat64.toNat(id.slot)] != 0) Runtime.trap("local actor retirement is busy");
       label clean loop {
         switch (e.pending) {
           case null break clean;
