@@ -3,6 +3,7 @@
 /// The actor* frontend will eventually generate receive/resume code; the initial
 /// fixture supplies it explicitly. This is not yet a public language feature.
 import LocalId "LocalId";
+import RegistryImage "RegistryImage";
 import Nat64 "mo:core/Nat64";
 import Runtime "mo:core/Runtime";
 import VarArray "mo:core/VarArray";
@@ -65,6 +66,9 @@ module {
     let free = VarArray.tabulate<Nat>(capacity, func i { i + 1 });
     var freeHead = 0;
     var live = 0;
+    // Allocated only when compiler-owned persistent instances are registered.
+    var persistentRows : ?[var ?RegistryImage.Payload<Any>] = null;
+    var restoringRegistry = false;
     let pending = VarArray.repeat<?Pending>(null, continuationCapacity);
     let continuationGenerations = VarArray.repeat<Nat64>(1, continuationCapacity);
     let continuationFree = VarArray.tabulate<Nat>(continuationCapacity, func i { i + 1 });
@@ -108,6 +112,7 @@ module {
     };
 
     func entry(id : Ref) : Entry {
+      if (restoringRegistry) Runtime.trap("actor registry restoration is not complete");
       if (id.container != container) Runtime.trap("foreign local-actor container");
       let i = Nat64.toNat(id.slot);
       if (i >= capacity) Runtime.trap("local actor slot out of range");
@@ -133,6 +138,7 @@ module {
     };
 
     func allocate(make : Ref -> Receiver) : Ref {
+      if (restoringRegistry) Runtime.trap("actor registry restoration is not complete");
       if (reading) Runtime.trap("actor creation is unavailable in a read-only call");
       if (freeHead >= capacity) Runtime.trap("local actor capacity exceeded");
       let i = freeHead;
@@ -178,27 +184,106 @@ module {
     /// Shares identity allocation and retirement with queued actors, but never
     /// installs a queued receiver. Factory execution is synchronous. Its private
     /// state is rooted by the registered method closures in this container heap.
-    public func spawnComputation(make : Ref -> ComputationStorage) : Ref {
-      allocate(func id {
-        let storage = make(id);
-        // Reject ambiguous compiler tables before publishing the identity.
-        var i = 0;
-        while (i < storage.methods.size()) {
-          let method = storage.methods[i];
-          if (method.name == "" or method.signature == "") Runtime.trap("invalid computation method descriptor");
-          var j = 0;
-          while (j < i) {
-            if (storage.methods[j].name == method.name) Runtime.trap("duplicate computation method");
-            j += 1
-          };
-          i += 1
+    func computationReceiver(storage : ComputationStorage) : Receiver {
+      var i = 0;
+      while (i < storage.methods.size()) {
+        let method = storage.methods[i];
+        if (method.name == "" or method.signature == "") Runtime.trap("invalid computation method descriptor");
+        var j = 0;
+        while (j < i) {
+          if (storage.methods[j].name == method.name) Runtime.trap("duplicate computation method");
+          j += 1
         };
-        { computations = ?storage; root = null;
-          receive = func (_caller : ?Caller, _method : Text, _arg : Blob) : Step {
-            Runtime.trap("computation actor requires inline dispatch")
-          }
+        i += 1
+      };
+      {computations=?storage;root=null;
+        receive=func(_caller : ?Caller,_method : Text,_arg : Blob) : Step {
+          Runtime.trap("computation actor requires inline dispatch")
         }
+      }
+    };
+    public func spawnComputation(make : Ref -> ComputationStorage) : Ref {
+      allocate(func id {computationReceiver(make(id))})
+    };
+
+    /// Trusted compiler ABI. The typed class envelope owns schema/data casts.
+    public func spawnPersistentComputation(schema : Text, make : Ref -> (ComputationStorage,Any)) : Ref {
+      if(schema=="") Runtime.trap("missing actor registry class schema");
+      allocate(func id {
+        let (storage,data)=make(id);
+        let receiver=computationReceiver(storage);
+        let rows=switch(persistentRows){case(?rows)rows;case null {
+          let rows=VarArray.repeat<?RegistryImage.Payload<Any>>(null,capacity);
+          persistentRows:=?rows;rows
+        }};
+        rows[Nat64.toNat(id.slot)]:=?{schema;data};receiver
       })
+    };
+    func registryQuiescent() {
+      if(restoringRegistry or reading or pendingCount!=0 or computationDepth!=0)
+        Runtime.trap("actor registry persistence requires a quiescent container");
+      for(i in suspendedComputations.keys()) {
+        if(suspendedComputations[i]!=0 or queuedComputations[i]!=0)
+          Runtime.trap("actor registry persistence has pending computations")
+      }
+    };
+    /// A non-mutating upgrade projection. Explicitly transient instances are
+    /// discarded and their generations burned/advanced in the image, not live RAM.
+    public func snapshotComputationRegistry() : RegistryImage.Image<Any> {
+      registryQuiescent();
+      let gs=VarArray.tabulate<Nat64>(capacity,func i {generations[i]});
+      let rs=VarArray.tabulate<Nat64>(capacity,func i {retiredGenerations[i]});
+      let links=VarArray.tabulate<Nat>(capacity,func i {free[i]});
+      var head=freeHead;
+      let rows=VarArray.repeat<?RegistryImage.Payload<Any>>(null,capacity);
+      var i=0;
+      while(i < capacity) {
+        switch(actors[i]) {
+          case null {};
+          case(?actorEntry) {
+            switch(actorEntry.instance.computations){case null Runtime.trap("queued actor registry upgrade is unsupported");case _ {}};
+            let payload=switch(persistentRows){case(?stored)stored[i];case null null};
+            switch(payload) {
+              case(?value) rows[i]:=?value;
+              case null {
+                rs[i]:=gs[i];
+                if(gs[i]!=RegistryImage.maxGeneration){gs[i]+=1;links[i]:=head;head:=i}
+              }
+            }
+          }
+        };
+        i+=1
+      };
+      let image={version=1;owner=container;generations=VarArray.toArray(gs);retired=VarArray.toArray(rs);free=VarArray.toArray(links);head;rows=VarArray.toArray(rows)};
+      switch(RegistryImage.validate(image,container,capacity)){case(?why)Runtime.trap(why);case null {}};
+      image
+    };
+    /// Build the candidate privately; publish only after all schemas bind.
+    /// Rebinding may create methods, but cannot call or mutate this registry.
+    public func restoreComputationRegistry(image : RegistryImage.Image<Any>,
+      rebind : (Ref,Text,Any) -> ComputationStorage) {
+      registryQuiescent();
+      if(live!=0) Runtime.trap("actor registry restoration requires a fresh registry");
+      for(i in generations.keys()) if(generations[i]!=1 or retiredGenerations[i]!=0)
+        Runtime.trap("actor registry restoration requires a fresh registry");
+      switch(RegistryImage.validate(image,container,capacity)){case(?why)Runtime.trap(why);case null {}};
+      restoringRegistry:=true;
+      let candidate=VarArray.repeat<?Entry>(null,capacity);
+      var restoredLive=0;
+      for(i in image.rows.keys()) switch(image.rows[i]) {
+        case null {};
+        case(?payload) {
+          let identity={container;slot=Nat64.fromNat(i);generation=image.generations[i]};
+          let instance=computationReceiver(rebind(identity,payload.schema,payload.data));
+          candidate[i]:=?{identity;instance;var queries=null;var pending=null};restoredLive+=1
+        }
+      };
+      for(i in generations.keys()) {
+        generations[i]:=image.generations[i];retiredGenerations[i]:=image.retired[i];
+        free[i]:=image.free[i];actors[i]:=candidate[i]
+      };
+      persistentRows:=?VarArray.tabulate<?RegistryImage.Payload<Any>>(capacity,func i {image.rows[i]});
+      freeHead:=image.head;live:=restoredLive;restoringRegistry:=false
     };
     /// Call from INSIDE the deferred computation, on every execution. Resolving
     /// while building/caching a bound computation would bypass retirement.
@@ -433,6 +518,7 @@ module {
       let i = Nat64.toNat(id.slot);
       retiredGenerations[i] := id.generation;
       actors[i] := null;
+      switch(persistentRows){case(?rows) rows[i]:=null;case null {}};
       live -= 1;
       if (generations[i] != 18_446_744_073_709_551_615) {
         generations[i] += 1;
