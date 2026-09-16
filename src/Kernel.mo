@@ -82,6 +82,26 @@ module {
     var computationDepth = 0;
     // Parked invocations retain retirement ownership but are not ambient callers.
     let suspendedComputations = VarArray.repeat<Nat>(0, capacity);
+    // T62: a scheduled timer job captured this actor; until it fires (one-shot) or is
+    // cancelled (recurring) the actor is as busy as with a queued task. Heap state, so a
+    // trapped segment's scheduling rolls back with the timer node itself.
+    let pendingTimers = VarArray.repeat<Nat>(0, capacity);
+    var timerHolds : [(Nat, Nat)] = [];
+    var timerBridge : ?{set : (Nat64, Bool, () -> async ()) -> Nat; cancel : Nat -> ()} = null;
+    // T62b: cycles are attached to the CONTAINER's next outgoing call; no hold is involved,
+    // and the stash (`@cycles`) is heap state, so it rolls back with the segment.
+    var cyclesBridge : ?(Nat -> ()) = null;
+    public func installCyclesBridge(add : Nat -> ()) { cyclesBridge := ?add };
+    func releaseTimerHold(id : Nat) {
+      var slot : ?Nat = null;
+      timerHolds := Array.filter<(Nat, Nat)>(timerHolds, func h { if (h.0 == id) { slot := ?h.1; false } else true });
+      switch slot { case (?s) { assert pendingTimers[s] > 0; pendingTimers[s] -= 1 }; case null {} }
+    };
+    /// Installed once by generated container code, never by an author. Absent bridge means
+    /// timers are unavailable (hand-built kernels in fixtures), and the capability traps.
+    public func installTimerBridge(set : (Nat64, Bool, () -> async ()) -> Nat, cancel : Nat -> ()) {
+      timerBridge := ?{set; cancel}
+    };
     // Creation retains the owner until the independently scheduled body enters.
     let queuedComputations = VarArray.repeat<Nat>(0, capacity);
     // Explicit bound for inline recursion, independent of display/actor count.
@@ -227,7 +247,7 @@ module {
       if(restoringRegistry or reading or pendingCount!=0 or computationDepth!=0)
         Runtime.trap("actor registry persistence requires a quiescent container");
       for(i in suspendedComputations.keys()) {
-        if(suspendedComputations[i]!=0 or queuedComputations[i]!=0)
+        if(suspendedComputations[i]!=0 or queuedComputations[i]!=0 or pendingTimers[i]!=0)
           Runtime.trap("actor registry persistence has pending computations")
       }
     };
@@ -458,9 +478,58 @@ module {
     };
     /// Explicit source self-retirement authority, tied to this invocation ticket.
     /// It cannot retire a sibling or be saved and reused by a later invocation.
-    public func computationRetirementContext() : {self : Ref; caller : Caller; retire : () -> ()} {
+    /// T62c: the capabilities an actor* receives while it is being CONSTRUCTED
+    /// (`shared({setTimer}) actor* class …`). Same record as a method's source context so
+    /// one pattern type serves both; `retire` is meaningless here and traps. The owner's slot
+    /// is reserved but not yet registered, so liveness is not checked at scheduling time --
+    /// a constructor trap rolls the hold back with the registration.
+    public func constructionContext(self : Ref) : {self : Ref; caller : Caller; retire : () -> (); setTimer : (Nat64, Bool, () -> async ()) -> Nat; cancelTimer : Nat -> (); addCycles : Nat -> ()} {
+      let caller : Caller = switch computationFrame { case (?(_, parent, _)) #local(parent.self); case null #host };
+      let caps = capabilitiesFor(self, false);
+      {self; caller; retire = func () { Runtime.trap("retirement is unavailable during construction") };
+       setTimer = caps.setTimer; cancelTimer = caps.cancelTimer; addCycles = caps.addCycles}
+    };
+    /// The author-only capabilities, for a live method invocation (`live`: the owner must be
+    /// registered) or for a constructor (`live = false`, slot reserved, not yet registered).
+    func capabilitiesFor(owner : Ref, live : Bool) : {setTimer : (Nat64, Bool, () -> async ()) -> Nat; cancelTimer : Nat -> (); addCycles : Nat -> ()} {
+      {setTimer=func (delayNanos : Nat64, recurring : Bool, job : () -> async ()) : Nat {
+        let ?bridge = timerBridge else Runtime.trap("actor* timers are unavailable in this container");
+        if (reading) Runtime.trap("actor* timers are unavailable in a read-only call");
+        if (live) ignore entry(owner);
+        let slot = Nat64.toNat(owner.slot);
+        var id = 0;
+        // Fired by the container's timer helper as an ordinary self-message with an empty
+        // computation stack. Push the owner's frame so the job -- an S35 private task created
+        // inside the owner -- captures the owner and starts with caller #local(owner).
+        let fire = func () : async () {
+          if (not recurring) releaseTimerHold(id);
+          if (computationDepth != 0) Runtime.trap("timer job requires an empty computation stack");
+          let ticket = enterComputation(owner, #host);
+          ignore job();
+          leaveComputation(ticket)
+        };
+        id := bridge.set(delayNanos, recurring, fire);
+        pendingTimers[slot] += 1;
+        timerHolds := Array.concat(timerHolds, [(id, slot)]);
+        id
+       };
+       cancelTimer=func (id : Nat) {
+        let ?bridge = timerBridge else Runtime.trap("actor* timers are unavailable in this container");
+        bridge.cancel(id);
+        releaseTimerHold(id)
+       };
+       addCycles=func (amount : Nat) {
+        let ?add = cyclesBridge else Runtime.trap("actor* cycles are unavailable in this container");
+        if (reading) Runtime.trap("actor* cycles are unavailable in a read-only call");
+        add(amount)
+       }}
+    };
+    public func computationRetirementContext() : {self : Ref; caller : Caller; retire : () -> (); setTimer : (Nat64, Bool, () -> async ()) -> Nat; cancelTimer : Nat -> (); addCycles : Nat -> ()} {
       let ?(ticket, context, _) = computationFrame else Runtime.trap("no executing computation actor");
-      {self=context.self; caller=context.caller; retire=func () {
+      let caps = capabilitiesFor(context.self, true);
+      {self=context.self; caller=context.caller;
+       setTimer=caps.setTimer; cancelTimer=caps.cancelTimer; addCycles=caps.addCycles;
+       retire=func () {
         let ?(active, current, parent) = computationFrame else Runtime.trap("no executing computation actor");
         if(active != ticket or current.self != context.self)
           Runtime.trap("retirement requires its current computation invocation");
@@ -475,7 +544,7 @@ module {
           }
         };
         retire(current.self)
-      }}
+       }}
     };
     public func leaveComputation(ticket : Nat) {
       switch computationFrame {
@@ -523,6 +592,7 @@ module {
       if (reading) Runtime.trap("actor retirement is unavailable in a read-only call");
       let e = entry(id);
       if (suspendedComputations[Nat64.toNat(id.slot)] != 0 or queuedComputations[Nat64.toNat(id.slot)] != 0) Runtime.trap("local actor retirement is busy");
+      if (pendingTimers[Nat64.toNat(id.slot)] != 0) Runtime.trap("local actor retirement is busy: a scheduled timer job still captures it");
       label clean loop {
         switch (e.pending) {
           case null break clean;
