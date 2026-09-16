@@ -7,6 +7,7 @@ import RegistryImage "RegistryImage";
 import Nat64 "mo:core/Nat64";
 import Runtime "mo:core/Runtime";
 import VarArray "mo:core/VarArray";
+import Array "mo:core/Array";
 import List "mo:core/List";
 
 module {
@@ -216,8 +217,11 @@ module {
           let rows=VarArray.repeat<?RegistryImage.Payload<Any>>(null,capacity);
           persistentRows:=?rows;rows
         }};
-        rows[Nat64.toNat(id.slot)]:=?{schema;data};receiver
+        rows[Nat64.toNat(id.slot)]:=?{schema;data;methods=methodContracts(storage)};receiver
       })
+    };
+    func methodContracts(storage:ComputationStorage):[RegistryImage.Method] {
+      Array.map<ComputationMethod,RegistryImage.Method>(storage.methods,func method {{name=method.name;signature=method.signature}})
     };
     func registryQuiescent() {
       if(restoringRegistry or reading or pendingCount!=0 or computationDepth!=0)
@@ -241,10 +245,10 @@ module {
         switch(actors[i]) {
           case null {};
           case(?actorEntry) {
-            switch(actorEntry.instance.computations){case null Runtime.trap("queued actor registry upgrade is unsupported");case _ {}};
+            let ?storage=actorEntry.instance.computations else Runtime.trap("queued actor registry upgrade is unsupported");
             let payload=switch(persistentRows){case(?stored)stored[i];case null null};
             switch(payload) {
-              case(?value) rows[i]:=?value;
+              case(?value) rows[i]:=?{value with methods=methodContracts(storage)};
               case null {
                 rs[i]:=gs[i];
                 if(gs[i]!=RegistryImage.maxGeneration){gs[i]+=1;links[i]:=head;head:=i}
@@ -254,7 +258,7 @@ module {
         };
         i+=1
       };
-      let image={version=1;owner=container;generations=VarArray.toArray(gs);retired=VarArray.toArray(rs);free=VarArray.toArray(links);head;rows=VarArray.toArray(rows)};
+      let image={version=RegistryImage.version;owner=container;generations=VarArray.toArray(gs);retired=VarArray.toArray(rs);free=VarArray.toArray(links);head;rows=VarArray.toArray(rows)};
       switch(RegistryImage.validate(image,container,capacity)){case(?why)Runtime.trap(why);case null {}};
       image
     };
@@ -274,7 +278,17 @@ module {
         case null {};
         case(?payload) {
           let identity={container;slot=Nat64.fromNat(i);generation=image.generations[i]};
-          let instance=computationReceiver(rebind(identity,payload.schema,payload.data));
+          let storage=rebind(identity,payload.schema,payload.data);
+          // Existing references retain their method contracts. New methods may
+          // be added; removing or changing a saved method requires migration.
+          for(previous in payload.methods.vals()) {
+            var compatible=false;
+            for(current in storage.methods.vals()) {
+              if(current.name==previous.name and current.signature==previous.signature) compatible:=true
+            };
+            if(not compatible) Runtime.trap("incompatible persistent actor method contract: " # previous.name)
+          };
+          let instance=computationReceiver(storage);
           candidate[i]:=?{identity;instance;var queries=null;var pending=null};restoredLive+=1
         }
       };
