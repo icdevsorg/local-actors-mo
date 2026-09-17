@@ -52,6 +52,10 @@ module {
   type Pending = { identity : Continuation; resume : Reply -> Step; cleanup : ?(() -> ()); var prev : ?Nat; var next : ?Nat };
 
   public class Kernel(container : Principal, capacity : Nat, continuationCapacity : Nat) {
+    /// M8/T71: the outward spelling of an identity (`Actor.id`), for the compiler-generated local
+    /// closure of an exported method, which names itself to the container's façade
+    /// (`World.K_m(id, …)`). Data only; the registry never consults it.
+    public func identityPrincipal(id : Ref) : Principal { LocalId.encode({slot = id.slot; generation = id.generation}) };
     /// Pure reference construction: validation and canonical owner binding only.
     public func referenceComputation(owner : ?Principal, id : Principal) : Ref {
       let ?parts=LocalId.decode(id) else Runtime.trap("invalid actor* local ID");

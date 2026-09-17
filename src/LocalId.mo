@@ -8,7 +8,7 @@ import Principal "mo:core/Principal";
 
 module {
   public type Parts = {slot : Nat64; generation : Nat64};
-  public type Address = {owner : Principal; id : Principal};
+  public type Address = {container : Principal; id : Principal};
   public type Prototype = {container : Principal; slot : Nat64; generation : Nat64};
 
   public func encode(parts : Parts) : Principal {
@@ -46,12 +46,12 @@ module {
 
   /// Exact compatibility with the current internal identity representation.
   public func fromPrototype(value : Prototype) : Address {
-    {owner = value.container; id = encode({slot=value.slot; generation=value.generation})}
+    {container = value.container; id = encode({slot=value.slot; generation=value.generation})}
   };
   public func toPrototype(address : Address) : ?Prototype {
     switch(decode(address.id)) {
       case null null;
-      case(?parts) ?{container=address.owner;slot=parts.slot;generation=parts.generation}
+      case(?parts) ?{container=address.container;slot=parts.slot;generation=parts.generation}
     }
   };
 }
