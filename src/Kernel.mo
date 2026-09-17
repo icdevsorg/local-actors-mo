@@ -38,7 +38,11 @@ module {
   /// Compiler-private type erasure. Only the compiler may supply a signature
   /// and reconstitute a closure after resolveComputation validates it. This is
   /// not a source-level dynamic cast or a serializable method representation.
-  public type ComputationMethod = { name : Text; signature : Text; value : Any };
+  /// `nameKey`/`signatureKey` (M7/O1) are COMPILER CONSTANTS: the table entry and the call site are
+  /// hashed from the same texts at compile time, so the kernel never hashes and resolution compares
+  /// integers instead of a name and a ~60-character signature. The texts stay for diagnostics and for
+  /// the upgrade image's method contracts, and `resolveComputation` still resolves by them.
+  public type ComputationMethod = { name : Text; signature : Text; nameKey : Nat32; signatureKey : Nat64; value : Any };
   /// T81: an actor* class's `system func preupgrade/postupgrade`, rebuilt with its methods.
   public type ComputationStorage = { methods : [ComputationMethod]; postupgrade : ?(() -> ()); preupgrade : ?(() -> ()) };
   /// Trusted ingress provenance. Local provenance is derived from the executing
@@ -52,8 +56,8 @@ module {
   public type ComputationTask = { start : () -> (); finish : () -> (); settle : () -> () };
   type TaskPhase = { #queued; #running : Nat; #finished; #settled };
   type Origin = { #known : Caller; #message };
-  type FrameContext = { self : Ref; origin : Origin };
-  type ComputationFrame = ?(Nat, FrameContext, ComputationFrame);
+  /// M7/O2b: the parked stack of a suspended invocation, the only place frames are ever copied.
+  type SavedFrames = { slots : [Nat64]; generations : [Nat64]; tickets : [Nat]; depth : Nat; root : Origin };
   type Receiver = { receive : (?Caller, Text, Blob) -> Step; root : ?((Caller,Nat64,Nat64) -> Step); computations : ?ComputationStorage };
   type Entry = { identity : Ref; instance : Receiver; var queries : ?[Text]; var pending : ?Nat };
   type Pending = { identity : Continuation; resume : Reply -> Step; cleanup : ?(() -> ()); var prev : ?Nat; var next : ?Nat };
@@ -88,7 +92,6 @@ module {
     var pendingCount = 0;
     var retired = List.empty<Ref>();
     var reading = false;
-    var computationFrame : ComputationFrame = null;
     var computationTicket = 0;
     var computationDepth = 0;
     /// M7/O3b: a callback's `restore()` no longer re-pushes the parked frames eagerly. It records
@@ -99,10 +102,19 @@ module {
     /// trap in a callback (S31/S34/S41 regressions). A pending restore reaching a message entry can
     /// only come from such a chain, so discarding it there is exact; the strict "empty stack"
     /// checks at those entries keep guarding REAL frames.
-    var pendingRestore : ?(ComputationFrame, Nat) = null;
+    var pendingRestore : ?SavedFrames = null;
     func materialize() {
       switch pendingRestore {
-        case (?(frame, depth)) { computationFrame := frame; computationDepth := depth; pendingRestore := null };
+        case (?saved) {
+          pendingRestore := null;
+          var i = 0;
+          while (i < saved.depth) {
+            frameSlot[i] := saved.slots[i]; frameGeneration[i] := saved.generations[i]; frameTicket[i] := saved.tickets[i];
+            i += 1
+          };
+          rootOrigin := saved.root;
+          computationDepth := saved.depth
+        };
         case null {}
       }
     };
@@ -131,6 +143,20 @@ module {
     let queuedComputations = VarArray.repeat<Nat>(0, capacity);
     // Explicit bound for inline recursion, independent of display/actor count.
     let computationDepthLimit = 128;
+    /// M7/O2b: ALLOCATION-FREE frame stack. It was a linked `?(ticket, {self; origin}, parent)`:
+    /// an option, a tuple and a record allocated on EVERY enter (~72 B of the ~709 B one actor*
+    /// call allocated, and under private GC the collector's share is proportional to bytes). The
+    /// depth is bounded by `computationDepthLimit` anyway, so the stack is three pre-allocated
+    /// arrays indexed by depth, holding SCALARS: `entry()` has already proved every id's container
+    /// is this container, so a frame is just its slot and generation. A `Ref` record is rebuilt
+    /// only when a body actually asks (`computationContext`), and a nested frame's caller is
+    /// derived from the frame below it, so only the ROOT frame's origin is stored.
+    let frameSlot = VarArray.repeat<Nat64>(0, computationDepthLimit);
+    let frameGeneration = VarArray.repeat<Nat64>(0, computationDepthLimit);
+    let frameTicket = VarArray.repeat<Nat>(0, computationDepthLimit);
+    var rootOrigin : Origin = #known(#host);
+    func selfAt(level : Nat) : Ref = { container; slot = frameSlot[level]; generation = frameGeneration[level] };
+    func callerAt(level : Nat) : Caller = if (level == 0) callerOf(rootOrigin) else #local(selfAt(level - 1));
     var scalarRootPublisher : ?((Ref,Ref,Nat64,Nat64) -> ()) = null;
     public func installScalarRequests(publish : (Ref,Ref,Nat64,Nat64) -> ()) {
       assert live == 0 and pendingCount == 0;
@@ -374,6 +400,21 @@ module {
     /// Call from INSIDE the deferred computation, on every execution. Resolving
     /// while building/caching a bound computation would bypass retirement.
     /// No method invocation, message, continuation allocation or commit occurs.
+    /// The path generated code takes. Measured: the text scan below was ~1,000 instructions per
+    /// call and ~1,700 with a record-typed signature -- 5 % of an actor* call.
+    public func resolveComputationKey(id : Ref, nameKey : Nat32, signatureKey : Nat64) : Any {
+      let e = entry(id);
+      let ?storage = e.instance.computations else Runtime.trap("actor lacks computation storage");
+      for (candidate in storage.methods.vals()) {
+        if (candidate.nameKey == nameKey) {
+          if (candidate.signatureKey != signatureKey) Runtime.trap("computation method signature mismatch");
+          return candidate.value
+        }
+      };
+      Runtime.trap("unknown computation method")
+    };
+    /// Resolution BY TEXT, for hand-written kernel witnesses (S20/S21) and any caller that holds the
+    /// names rather than the compiler's constants. Same entry checks, same traps, same scan shape.
     public func resolveComputation(id : Ref, method : Text, signature : Text) : Any {
       let e = entry(id);
       let ?storage = e.instance.computations else Runtime.trap("actor lacks computation storage");
@@ -418,21 +459,21 @@ module {
         case null Runtime.trap("actor lacks computation storage");
         case _ {};
       };
-      let origin : Origin = switch computationFrame {
-        case (?( _, parent, _)) #known(#local(parent.self));
-        case null switch ingress {
-          case (#host) #known(#host);
-          case (#external principal) #known(#external(principal));
-          case (#message) #message;
-        };
-      };
       // A depth or receiver ID alone would allow a stale exit token to pop a
       // later frame, particularly during A -> B -> A reentry. Never reuse a
       // ticket within a committed heap history. Trap rollback rolls back both.
       if (computationDepth >= computationDepthLimit) Runtime.trap("local computation depth limit exceeded");
-      computationDepth += 1;
+      // Only a ROOT frame carries an ingress; a nested frame's caller is the frame below it.
+      if (computationDepth == 0) rootOrigin := (switch ingress {
+        case (#host) #known(#host);
+        case (#external principal) #known(#external(principal));
+        case (#message) #message;
+      });
       computationTicket += 1;
-      computationFrame := ?(computationTicket, {self = id; origin}, computationFrame);
+      frameSlot[computationDepth] := id.slot;
+      frameGeneration[computationDepth] := id.generation;
+      frameTicket[computationDepth] := computationTicket;
+      computationDepth += 1;
       computationTicket
     };
     /// Compiler-only continuation capability. Evaluate the future operand first,
@@ -444,40 +485,41 @@ module {
     /// No world state is captured here, only immutable frame/context metadata.
     public func suspendComputation() : () -> () {
       materialize();
-      let saved = computationFrame;
       let depth = computationDepth;
-      var cursor = saved;
-      label validate loop {
-        let ?(_, context, rest) = cursor else break validate;
+      var level = 0;
+      while (level < depth) {
         // A retired invocation may unwind, but cannot acquire a new suspension.
-        ignore entry(context.self);
-        cursor := rest
+        ignore entry(selfAt(level));
+        level += 1
       };
-      cursor := saved;
-      label park loop {
-        let ?(_, context, rest) = cursor else break park;
-        let slot = Nat64.toNat(context.self.slot);
-        suspendedComputations[slot] += 1;
-        cursor := rest
+      level := 0;
+      while (level < depth) {
+        suspendedComputations[Nat64.toNat(frameSlot[level])] += 1;
+        level += 1
       };
-      computationFrame := null;
+      // The one place frames are copied: a suspension parks the whole stack off the arrays.
+      let saved : SavedFrames = {
+        slots = Array.tabulate<Nat64>(depth, func i = frameSlot[i]);
+        generations = Array.tabulate<Nat64>(depth, func i = frameGeneration[i]);
+        tickets = Array.tabulate<Nat>(depth, func i = frameTicket[i]);
+        depth; root = rootOrigin
+      };
       computationDepth := 0;
       var consumed = false;
       func () {
         if (consumed) Runtime.trap("computation suspension already restored");
         discardPending();
         if (computationDepth != 0) Runtime.trap("computation restoration requires an empty stack");
-        var remaining = saved;
-        label restore loop {
-          let ?(_, context, rest) = remaining else break restore;
-          ignore entry(context.self);
-          let slot = Nat64.toNat(context.self.slot);
+        var back = 0;
+        while (back < saved.depth) {
+          ignore entry({ container; slot = saved.slots[back]; generation = saved.generations[back] });
+          let slot = Nat64.toNat(saved.slots[back]);
           assert suspendedComputations[slot] > 0;
           suspendedComputations[slot] -= 1;
-          remaining := rest
+          back += 1
         };
         consumed := true;
-        pendingRestore := ?(saved, depth)
+        pendingRestore := ?saved
       }
     };
     /// Prepare in the creating segment, before staging the ordinary async send.
@@ -491,10 +533,8 @@ module {
     /// This ABI alone does not admit private source async bodies.
     public func prepareComputationTask() : ComputationTask {
       materialize();
-      let ?(_, context, _) = computationFrame else return {
-        start = func () {}; finish = func () {}; settle = func () {}
-      };
-      let owner = context.self;
+      if (computationDepth == 0) return { start = func () {}; finish = func () {}; settle = func () {} };
+      let owner = selfAt(computationDepth - 1);
       ignore entry(owner);
       let slot = Nat64.toNat(owner.slot);
       queuedComputations[slot] += 1;
@@ -507,7 +547,7 @@ module {
           let ticket = enterComputation(owner, #host);
           // This is a new invocation caused by the owning actor, not a replay
           // of the external caller that originally entered its creator.
-          computationFrame := ?(ticket, {self = owner; origin = #known(#local(owner))}, null);
+          rootOrigin := #known(#local(owner));
           assert queuedComputations[slot] > 0;
           queuedComputations[slot] -= 1;
           phase := #running(ticket)
@@ -538,10 +578,8 @@ module {
     };
     public func computationContext() : Context {
       materialize();
-      switch computationFrame {
-        case (?( _, context, _)) ({self = context.self; caller = callerOf(context.origin)});
-        case null Runtime.trap("no executing computation actor");
-      }
+      if (computationDepth == 0) Runtime.trap("no executing computation actor");
+      { self = selfAt(computationDepth - 1); caller = callerAt(computationDepth - 1) }
     };
     /// Explicit source self-retirement authority, tied to this invocation ticket.
     /// It cannot retire a sibling or be saved and reused by a later invocation.
@@ -552,7 +590,7 @@ module {
     /// a constructor trap rolls the hold back with the registration.
     public func constructionContext(self : Ref) : {self : Ref; caller : Caller; retire : () -> ()} {
       materialize();
-      let caller : Caller = switch computationFrame { case (?(_, parent, _)) #local(parent.self); case null #host };
+      let caller : Caller = if (computationDepth == 0) #host else #local(selfAt(computationDepth - 1));
       {self; caller; retire = func () { Runtime.trap("retirement is unavailable during construction") }}
     };
     var constructing : ?Ref = null;
@@ -562,10 +600,10 @@ module {
     /// task with caller #local(owner) and holds retirement, exactly as the retired capability did.
     public func frameSetTimer(delayNanos : Nat64, recurring : Bool, job : () -> async ()) : Nat {
       materialize();
-      switch (computationFrame, constructing) {
-        case (?(_, context, _), _) capabilitiesFor(context.self, true).setTimer(delayNanos, recurring, job);
-        case (null, ?id) capabilitiesFor(id, false).setTimer(delayNanos, recurring, job);
-        case (null, null) Runtime.trap("actor* timers require an executing actor* frame");
+      if (computationDepth > 0) return capabilitiesFor(selfAt(computationDepth - 1), true).setTimer(delayNanos, recurring, job);
+      switch constructing {
+        case (?id) capabilitiesFor(id, false).setTimer(delayNanos, recurring, job);
+        case null Runtime.trap("actor* timers require an executing actor* frame");
       }
     };
     public func frameCancelTimer(id : Nat) {
@@ -606,24 +644,26 @@ module {
     };
     public func computationRetirementContext() : {self : Ref; caller : Caller; retire : () -> ()} {
       materialize();
-      let ?(ticket, context, _) = computationFrame else Runtime.trap("no executing computation actor");
-      {self=context.self; caller=callerOf(context.origin);
+      if (computationDepth == 0) Runtime.trap("no executing computation actor");
+      let ticket = frameTicket[computationDepth - 1];
+      let self = selfAt(computationDepth - 1);
+      {self; caller=callerAt(computationDepth - 1);
        retire=func () {
         materialize();
-        let ?(active, current, parent) = computationFrame else Runtime.trap("no executing computation actor");
-        if(active != ticket or current.self != context.self)
+        if (computationDepth == 0) Runtime.trap("no executing computation actor");
+        // `top` counts DOWN from the depth, so the subtraction is on a value the guard above has
+        // already proved positive; spelled with an explicit Nat annotation to keep M0155 quiet in
+        // the bundled runtime (it would print on every user build).
+        let top : Nat = computationDepth - 1 : Nat;
+        if(frameTicket[top] != ticket or frameSlot[top] != self.slot or frameGeneration[top] != self.generation)
           Runtime.trap("retirement requires its current computation invocation");
-        var cursor=parent;
-        label scan loop {
-          switch cursor {
-            case null break scan;
-            case(?( _, other, rest)) {
-              if(other.self==current.self) Runtime.trap("local actor retirement is busy");
-              cursor := rest
-            }
-          }
+        var level = 0;
+        while (level < top) {
+          if (frameSlot[level] == self.slot and frameGeneration[level] == self.generation)
+            Runtime.trap("local actor retirement is busy");
+          level += 1
         };
-        retire(current.self)
+        retire(self)
        }}
     };
     var messageCaller : ?(() -> Principal) = null;
@@ -643,33 +683,22 @@ module {
     /// it took at `try` entry, and a call site's guard abandons its own invocation when an error
     /// passes through it. Frames strictly above a mark can only belong to invocations that ended
     /// by an error (a normal return leaves in order), so popping them is exact.
-    public func markComputation() : Nat { materialize(); switch computationFrame { case (?(ticket, _, _)) ticket; case null 0 } };
+    public func markComputation() : Nat { materialize(); if (computationDepth == 0) 0 else frameTicket[computationDepth - 1] };
     public func unwindComputation(mark : Nat) {
       materialize();
-      label pop loop switch computationFrame {
-        case (?(ticket, _, parent)) { if (ticket <= mark) break pop; computationFrame := parent; computationDepth -= 1 };
-        case null break pop
-      }
+      while (computationDepth > 0 and frameTicket[computationDepth - 1] > mark) computationDepth -= 1
     };
     /// Abandon the invocation entered with `ticket` and whatever it left behind. Tolerant of an
     /// already-unwound frame (a handler inside the invocation may have unwound first).
     public func abandonComputation(ticket : Nat) {
       materialize();
-      label pop loop switch computationFrame {
-        case (?(active, _, parent)) { if (active < ticket) break pop; computationFrame := parent; computationDepth -= 1 };
-        case null break pop
-      }
+      while (computationDepth > 0 and frameTicket[computationDepth - 1] >= ticket) computationDepth -= 1
     };
     public func leaveComputation(ticket : Nat) {
       materialize();
-      switch computationFrame {
-        case (?(current, _, parent)) {
-          if (ticket != current) Runtime.trap("computation frame exit out of order");
-          computationFrame := parent;
-          computationDepth -= 1
-        };
-        case null Runtime.trap("no executing computation actor");
-      }
+      if (computationDepth == 0) Runtime.trap("no executing computation actor");
+      if (ticket != frameTicket[computationDepth - 1]) Runtime.trap("computation frame exit out of order");
+      computationDepth -= 1
     };
     public func dispatchRoot(id : Ref,caller : Caller,slot : Nat64,generation : Nat64) : Frame {
       switch caller {case (#local source) {assert source.container == container};case _ Runtime.trap("rooted request requires local caller")};
