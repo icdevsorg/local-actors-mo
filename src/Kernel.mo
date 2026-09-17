@@ -39,7 +39,8 @@ module {
   /// and reconstitute a closure after resolveComputation validates it. This is
   /// not a source-level dynamic cast or a serializable method representation.
   public type ComputationMethod = { name : Text; signature : Text; value : Any };
-  public type ComputationStorage = { methods : [ComputationMethod] };
+  /// T81: an actor* class's `system func preupgrade/postupgrade`, rebuilt with its methods.
+  public type ComputationStorage = { methods : [ComputationMethod]; postupgrade : ?(() -> ()); preupgrade : ?(() -> ()) };
   /// Trusted ingress provenance. Local provenance is derived from the executing
   /// frame, never supplied by a bound method or its creator.
   public type ComputationIngress = { #host; #external : Principal };
@@ -258,7 +259,25 @@ module {
     };
     /// A non-mutating upgrade projection. Explicitly transient instances are
     /// discarded and their generations burned/advanced in the image, not live RAM.
+    /// T81: run each live instance's hook as its own task, in slot order; a trap aborts the upgrade.
+    func runHooks(select : ComputationStorage -> ?(() -> ())) {
+      var i=0;
+      while(i < capacity) {
+        switch(actors[i]) {
+          case null {};
+          case(?actorEntry) switch(actorEntry.instance.computations) {
+            case null {};
+            case(?storage) switch(select(storage)) {
+              case null {};
+              case(?hook) { let ticket=enterComputation(actorEntry.identity,#host); hook(); leaveComputation(ticket) }
+            }
+          }
+        };
+        i+=1
+      }
+    };
     public func snapshotComputationRegistry() : RegistryImage.Image<Any> {
+      runHooks(func s = s.preupgrade);
       registryQuiescent();
       let gs=VarArray.tabulate<Nat64>(capacity,func i {generations[i]});
       let rs=VarArray.tabulate<Nat64>(capacity,func i {retiredGenerations[i]});
@@ -290,7 +309,7 @@ module {
     /// Build the candidate privately; publish only after all schemas bind.
     /// Rebinding may create methods, but cannot call or mutate this registry.
     public func restoreComputationRegistry(image : RegistryImage.Image<Any>,
-      rebind : (Ref,Text,Any) -> ComputationStorage) {
+      rebind : (Ref,Text,Any) -> (ComputationStorage,Text,Any)) {
       registryQuiescent();
       if(live!=0) Runtime.trap("actor registry restoration requires a fresh registry");
       for(i in generations.keys()) if(generations[i]!=1 or retiredGenerations[i]!=0)
@@ -298,15 +317,19 @@ module {
       switch(RegistryImage.validate(image,container,capacity)){case(?why)Runtime.trap(why);case null {}};
       restoringRegistry:=true;
       let candidate=VarArray.repeat<?Entry>(null,capacity);
+      let newRows=VarArray.repeat<?RegistryImage.Payload<Any>>(null,capacity);
       var restoredLive=0;
       for(i in image.rows.keys()) switch(image.rows[i]) {
         case null {};
         case(?payload) {
           let identity={container;slot=Nat64.fromNat(i);generation=image.generations[i]};
-          let storage=rebind(identity,payload.schema,payload.data);
+          let (storage,schema,data)=rebind(identity,payload.schema,payload.data);
+          // T81: a migrated row is stored under its NEW schema and data; its method contracts are
+          // the new class's (a migration may change them, as an actor's migration may).
+          newRows[i]:=?{schema;data;methods=methodContracts(storage)};
           // Existing references retain their method contracts. New methods may
           // be added; removing or changing a saved method requires migration.
-          for(previous in payload.methods.vals()) {
+          if(schema==payload.schema) for(previous in payload.methods.vals()) {
             var compatible=false;
             for(current in storage.methods.vals()) {
               if(current.name==previous.name and current.signature==previous.signature) compatible:=true
@@ -321,8 +344,9 @@ module {
         generations[i]:=image.generations[i];retiredGenerations[i]:=image.retired[i];
         free[i]:=image.free[i];actors[i]:=candidate[i]
       };
-      persistentRows:=?VarArray.tabulate<?RegistryImage.Payload<Any>>(capacity,func i {image.rows[i]});
-      freeHead:=image.head;live:=restoredLive;restoringRegistry:=false
+      persistentRows:=?newRows;
+      freeHead:=image.head;live:=restoredLive;restoringRegistry:=false;
+      runHooks(func s = s.postupgrade)
     };
     /// Call from INSIDE the deferred computation, on every execution. Resolving
     /// while building/caching a bound computation would bypass retirement.
