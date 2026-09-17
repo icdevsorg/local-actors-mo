@@ -62,3 +62,10 @@ no timer adapter, hidden commits, external-effect exactly-once guarantee or live
 persistence. See `moxzi/runtime/tests/fixtures/cooperative/CheckpointJobs.mo` for the
 self-message example and `.plan/actor-star/followups/cooperative-execution/checkpoint-jobs.md`
 for the contract, evidence and remaining gates. No package release is implied.
+
+`JobSnapshot` optionally validates a cursor against exact ordered canonical identities
+and an application schema. `JobQueue` provides bounded round-robin admission with durable
+active/failed reservations and explicit recovery. Neither module performs hidden awaits
+or changes actor state ownership. Queue bounds include failed and in-flight jobs.
+These controls now run on native, Pulley and PocketIC; whole-world restoration is tested
+between the two local backends. Language-upgrade migration remains application work.

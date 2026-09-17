@@ -52,4 +52,13 @@ module {
     if(c.status != #ready) return #ok(c);
     #ok({c with generation=c.generation+1;status=#cancelled})
   };
+  /// Explicit new work generation after completion/cancellation. Previous actor
+  /// mutations remain; this intentionally starts a new ordered work list at zero.
+  /// Never use this to silently retry already committed work in the old job.
+  public func restart(c : Cursor, total : Nat) : Result<Cursor> {
+    if(not valid(c)) return #err(#invalid);
+    if(c.status==#ready) return #err(#inactive);
+    #ok(create(c.id,c.generation+1,total))
+  };
+
 };
