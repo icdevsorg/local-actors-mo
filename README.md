@@ -42,3 +42,23 @@ clock and snapshot calls. Its tests are `moxzi/runtime/tests/local_game.rs`, inc
 saved nested calls, lost committed replies, partial-admission compensation,
 retirement and identity reuse. Game source and framework player/save integration
 remain separate: the generic player does not yet select a local backend.
+
+### Experimental ordered checkpointed jobs
+
+`import Jobs "mo:local-actors/Jobs"` provides a versioned cursor and generation/position
+tickets for bounded work over an immutable ordered list of actor identities. Each
+actor retains its own state. `admit` rejects stale work before it executes; `complete`
+advances the cursor after a successful batch; `cancel` invalidates outstanding tickets
+without undoing committed batches.
+
+Authenticate continuation calls. Apply a batch and store its completed cursor in the
+same atomic segment, with no real await in any unit. Then explicitly schedule a real
+self-message/timer. `await*` alone does not commit. Trap if completion validation fails
+after mutation. These records are ordinary data, not authorization capabilities.
+
+Work-count limits do not guarantee fuel bounds: an indivisible oversized unit still
+needs subdivision or explicit failure/recovery policy. This initial module provides
+no timer adapter, hidden commits, external-effect exactly-once guarantee or live-stack
+persistence. See `moxzi/runtime/tests/fixtures/cooperative/CheckpointJobs.mo` for the
+self-message example and `.plan/actor-star/followups/cooperative-execution/checkpoint-jobs.md`
+for the contract, evidence and remaining gates. No package release is implied.
