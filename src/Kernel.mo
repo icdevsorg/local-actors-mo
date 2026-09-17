@@ -94,8 +94,6 @@ module {
     var timerBridge : ?{set : (Nat64, Bool, () -> async ()) -> Nat; cancel : Nat -> ()} = null;
     // T62b: cycles are attached to the CONTAINER's next outgoing call; no hold is involved,
     // and the stash (`@cycles`) is heap state, so it rolls back with the segment.
-    var cyclesBridge : ?(Nat -> ()) = null;
-    public func installCyclesBridge(add : Nat -> ()) { cyclesBridge := ?add };
     func releaseTimerHold(id : Nat) {
       var slot : ?Nat = null;
       timerHolds := Array.filter<(Nat, Nat)>(timerHolds, func h { if (h.0 == id) { slot := ?h.1; false } else true });
@@ -169,7 +167,10 @@ module {
       let i = freeHead;
       freeHead := free[i];
       let identity = { container; slot = Nat64.fromNat(i); generation = generations[i] };
+      // T80: the instance under construction owns the timers its constructor schedules.
+      let outer = constructing; constructing := ?identity;
       let instance = make(identity);
+      constructing := outer;
       actors[i] := ?{ identity; instance; var queries = null; var pending = null };
       live += 1;
       identity;
@@ -487,15 +488,30 @@ module {
     /// one pattern type serves both; `retire` is meaningless here and traps. The owner's slot
     /// is reserved but not yet registered, so liveness is not checked at scheduling time --
     /// a constructor trap rolls the hold back with the registration.
-    public func constructionContext(self : Ref) : {self : Ref; caller : Caller; retire : () -> (); setTimer : (Nat64, Bool, () -> async ()) -> Nat; cancelTimer : Nat -> (); addCycles : Nat -> ()} {
+    public func constructionContext(self : Ref) : {self : Ref; caller : Caller; retire : () -> ()} {
       let caller : Caller = switch computationFrame { case (?(_, parent, _)) #local(parent.self); case null #host };
-      let caps = capabilitiesFor(self, false);
-      {self; caller; retire = func () { Runtime.trap("retirement is unavailable during construction") };
-       setTimer = caps.setTimer; cancelTimer = caps.cancelTimer; addCycles = caps.addCycles}
+      {self; caller; retire = func () { Runtime.trap("retirement is unavailable during construction") }}
+    };
+    var constructing : ?Ref = null;
+    /// T80: the system pattern. `Timer.setTimer<system>` inside an actor* reaches the prelude
+    /// `@setTimer` through this bridge (the factory isolation rebinds the name): the owner is the
+    /// active frame's actor, or the instance under construction. The job runs as the owner's own
+    /// task with caller #local(owner) and holds retirement, exactly as the retired capability did.
+    public func frameSetTimer(delayNanos : Nat64, recurring : Bool, job : () -> async ()) : Nat {
+      switch (computationFrame, constructing) {
+        case (?(_, context, _), _) capabilitiesFor(context.self, true).setTimer(delayNanos, recurring, job);
+        case (null, ?id) capabilitiesFor(id, false).setTimer(delayNanos, recurring, job);
+        case (null, null) Runtime.trap("actor* timers require an executing actor* frame");
+      }
+    };
+    public func frameCancelTimer(id : Nat) {
+      let ?bridge = timerBridge else Runtime.trap("actor* timers are unavailable in this container");
+      bridge.cancel(id);
+      releaseTimerHold(id)
     };
     /// The author-only capabilities, for a live method invocation (`live`: the owner must be
     /// registered) or for a constructor (`live = false`, slot reserved, not yet registered).
-    func capabilitiesFor(owner : Ref, live : Bool) : {setTimer : (Nat64, Bool, () -> async ()) -> Nat; cancelTimer : Nat -> (); addCycles : Nat -> ()} {
+    func capabilitiesFor(owner : Ref, live : Bool) : {setTimer : (Nat64, Bool, () -> async ()) -> Nat; cancelTimer : Nat -> ()} {
       {setTimer=func (delayNanos : Nat64, recurring : Bool, job : () -> async ()) : Nat {
         let ?bridge = timerBridge else Runtime.trap("actor* timers are unavailable in this container");
         if (reading) Runtime.trap("actor* timers are unavailable in a read-only call");
@@ -521,18 +537,11 @@ module {
         let ?bridge = timerBridge else Runtime.trap("actor* timers are unavailable in this container");
         bridge.cancel(id);
         releaseTimerHold(id)
-       };
-       addCycles=func (amount : Nat) {
-        let ?add = cyclesBridge else Runtime.trap("actor* cycles are unavailable in this container");
-        if (reading) Runtime.trap("actor* cycles are unavailable in a read-only call");
-        add(amount)
        }}
     };
-    public func computationRetirementContext() : {self : Ref; caller : Caller; retire : () -> (); setTimer : (Nat64, Bool, () -> async ()) -> Nat; cancelTimer : Nat -> (); addCycles : Nat -> ()} {
+    public func computationRetirementContext() : {self : Ref; caller : Caller; retire : () -> ()} {
       let ?(ticket, context, _) = computationFrame else Runtime.trap("no executing computation actor");
-      let caps = capabilitiesFor(context.self, true);
       {self=context.self; caller=context.caller;
-       setTimer=caps.setTimer; cancelTimer=caps.cancelTimer; addCycles=caps.addCycles;
        retire=func () {
         let ?(active, current, parent) = computationFrame else Runtime.trap("no executing computation actor");
         if(active != ticket or current.self != context.self)
