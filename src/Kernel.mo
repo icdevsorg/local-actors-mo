@@ -43,11 +43,17 @@ module {
   public type ComputationStorage = { methods : [ComputationMethod]; postupgrade : ?(() -> ()); preupgrade : ?(() -> ()) };
   /// Trusted ingress provenance. Local provenance is derived from the executing
   /// frame, never supplied by a bound method or its creator.
-  public type ComputationIngress = { #host; #external : Principal };
+  /// M7/O2: `#message` is the container's current message caller, resolved LAZILY (through the
+  /// reader installed by the generated container) only when a body reads its context. Measured:
+  /// the eager `msg_caller` at every call site was ~7.1k instructions and ~97 B per call, paid
+  /// even when the kernel discarded it for a nested frame.
+  public type ComputationIngress = { #host; #external : Principal; #message };
   /// Compiler-private lease for one independently scheduled ordinary future.
   public type ComputationTask = { start : () -> (); finish : () -> (); settle : () -> () };
   type TaskPhase = { #queued; #running : Nat; #finished; #settled };
-  type ComputationFrame = ?(Nat, Context, ComputationFrame);
+  type Origin = { #known : Caller; #message };
+  type FrameContext = { self : Ref; origin : Origin };
+  type ComputationFrame = ?(Nat, FrameContext, ComputationFrame);
   type Receiver = { receive : (?Caller, Text, Blob) -> Step; root : ?((Caller,Nat64,Nat64) -> Step); computations : ?ComputationStorage };
   type Entry = { identity : Ref; instance : Receiver; var queries : ?[Text]; var pending : ?Nat };
   type Pending = { identity : Continuation; resume : Reply -> Step; cleanup : ?(() -> ()); var prev : ?Nat; var next : ?Nat };
@@ -85,6 +91,22 @@ module {
     var computationFrame : ComputationFrame = null;
     var computationTicket = 0;
     var computationDepth = 0;
+    /// M7/O3b: a callback's `restore()` no longer re-pushes the parked frames eagerly. It records
+    /// them here; the first operation that needs the stack materializes them, and every MESSAGE
+    /// ENTRY discards them instead. Why: the suspension's `finally restore` also runs on the
+    /// trap-CLEANUP chain (moc's finally semantics), where nothing will ever pop what it pushes --
+    /// the old per-call `finally leave` used to, and its removal left frames behind after every
+    /// trap in a callback (S31/S34/S41 regressions). A pending restore reaching a message entry can
+    /// only come from such a chain, so discarding it there is exact; the strict "empty stack"
+    /// checks at those entries keep guarding REAL frames.
+    var pendingRestore : ?(ComputationFrame, Nat) = null;
+    func materialize() {
+      switch pendingRestore {
+        case (?(frame, depth)) { computationFrame := frame; computationDepth := depth; pendingRestore := null };
+        case null {}
+      }
+    };
+    func discardPending() { pendingRestore := null };
     // Parked invocations retain retirement ownership but are not ambient callers.
     let suspendedComputations = VarArray.repeat<Nat>(0, capacity);
     // T62: a scheduled timer job captured this actor; until it fires (one-shot) or is
@@ -250,6 +272,7 @@ module {
       Array.map<ComputationMethod,RegistryImage.Method>(storage.methods,func method {{name=method.name;signature=method.signature}})
     };
     func registryQuiescent() {
+      discardPending();
       if(restoringRegistry or reading or pendingCount!=0 or computationDepth!=0)
         Runtime.trap("actor registry persistence requires a quiescent container");
       for(i in suspendedComputations.keys()) {
@@ -374,6 +397,7 @@ module {
     /// Set only by compiler-generated ordinary query ingress. Query execution
     /// discards the complete container heap, including this bit, on every exit.
     public func beginComputationQuery() {
+      discardPending();
       if (reading or computationDepth != 0) Runtime.trap("invalid computation query entry");
       reading := true
     };
@@ -381,17 +405,25 @@ module {
       if (not reading) Runtime.trap("actor* query requires an enclosing query");
       enterComputation(id, ingress)
     };
+    /// A ROOT call site (container code, frame depth 0): a message entry as far as the stack is
+    /// concerned, so a pending restore left by a trap-cleanup chain is discarded first.
+    public func enterRootComputation(id : Ref, ingress : ComputationIngress) : Nat {
+      discardPending();
+      enterComputation(id, ingress)
+    };
     public func enterComputation(id : Ref, ingress : ComputationIngress) : Nat {
+      materialize();
       let e = entry(id);
       switch (e.instance.computations) {
         case null Runtime.trap("actor lacks computation storage");
         case _ {};
       };
-      let caller : Caller = switch computationFrame {
-        case (?( _, parent, _)) #local(parent.self);
+      let origin : Origin = switch computationFrame {
+        case (?( _, parent, _)) #known(#local(parent.self));
         case null switch ingress {
-          case (#host) #host;
-          case (#external principal) #external(principal);
+          case (#host) #known(#host);
+          case (#external principal) #known(#external(principal));
+          case (#message) #message;
         };
       };
       // A depth or receiver ID alone would allow a stale exit token to pop a
@@ -400,7 +432,7 @@ module {
       if (computationDepth >= computationDepthLimit) Runtime.trap("local computation depth limit exceeded");
       computationDepth += 1;
       computationTicket += 1;
-      computationFrame := ?(computationTicket, {self = id; caller}, computationFrame);
+      computationFrame := ?(computationTicket, {self = id; origin}, computationFrame);
       computationTicket
     };
     /// Compiler-only continuation capability. Evaluate the future operand first,
@@ -411,6 +443,7 @@ module {
     ///
     /// No world state is captured here, only immutable frame/context metadata.
     public func suspendComputation() : () -> () {
+      materialize();
       let saved = computationFrame;
       let depth = computationDepth;
       var cursor = saved;
@@ -432,6 +465,7 @@ module {
       var consumed = false;
       func () {
         if (consumed) Runtime.trap("computation suspension already restored");
+        discardPending();
         if (computationDepth != 0) Runtime.trap("computation restoration requires an empty stack");
         var remaining = saved;
         label restore loop {
@@ -443,8 +477,7 @@ module {
           remaining := rest
         };
         consumed := true;
-        computationFrame := saved;
-        computationDepth := depth
+        pendingRestore := ?(saved, depth)
       }
     };
     /// Prepare in the creating segment, before staging the ordinary async send.
@@ -457,6 +490,7 @@ module {
     /// body must finish through ordinary cleanup before settlement can succeed.
     /// This ABI alone does not admit private source async bodies.
     public func prepareComputationTask() : ComputationTask {
+      materialize();
       let ?(_, context, _) = computationFrame else return {
         start = func () {}; finish = func () {}; settle = func () {}
       };
@@ -468,18 +502,21 @@ module {
       {
         start = func () {
           switch phase { case (#queued) {}; case _ Runtime.trap("computation task already started or settled") };
+          discardPending();
           if (computationDepth != 0) Runtime.trap("computation task requires an empty stack");
           let ticket = enterComputation(owner, #host);
           // This is a new invocation caused by the owning actor, not a replay
           // of the external caller that originally entered its creator.
-          computationFrame := ?(ticket, {self = owner; caller = #local(owner)}, null);
+          computationFrame := ?(ticket, {self = owner; origin = #known(#local(owner))}, null);
           assert queuedComputations[slot] > 0;
           queuedComputations[slot] -= 1;
           phase := #running(ticket)
         };
         finish = func () {
           let #running(ticket) = phase else Runtime.trap("computation task is not running");
-          leaveComputation(ticket);
+          // The task frame is a root: nested call sites inside the body carry no guard (O3b), so
+          // an error that left the body uncaught may have left frames above it. Abandon them too.
+          abandonComputation(ticket);
           phase := #finished
         };
         settle = func () {
@@ -500,8 +537,9 @@ module {
       }
     };
     public func computationContext() : Context {
+      materialize();
       switch computationFrame {
-        case (?( _, context, _)) context;
+        case (?( _, context, _)) ({self = context.self; caller = callerOf(context.origin)});
         case null Runtime.trap("no executing computation actor");
       }
     };
@@ -513,6 +551,7 @@ module {
     /// is reserved but not yet registered, so liveness is not checked at scheduling time --
     /// a constructor trap rolls the hold back with the registration.
     public func constructionContext(self : Ref) : {self : Ref; caller : Caller; retire : () -> ()} {
+      materialize();
       let caller : Caller = switch computationFrame { case (?(_, parent, _)) #local(parent.self); case null #host };
       {self; caller; retire = func () { Runtime.trap("retirement is unavailable during construction") }}
     };
@@ -522,6 +561,7 @@ module {
     /// active frame's actor, or the instance under construction. The job runs as the owner's own
     /// task with caller #local(owner) and holds retirement, exactly as the retired capability did.
     public func frameSetTimer(delayNanos : Nat64, recurring : Bool, job : () -> async ()) : Nat {
+      materialize();
       switch (computationFrame, constructing) {
         case (?(_, context, _), _) capabilitiesFor(context.self, true).setTimer(delayNanos, recurring, job);
         case (null, ?id) capabilitiesFor(id, false).setTimer(delayNanos, recurring, job);
@@ -547,6 +587,7 @@ module {
         // inside the owner -- captures the owner and starts with caller #local(owner).
         let fire = func () : async () {
           if (not recurring) releaseTimerHold(id);
+          discardPending();
           if (computationDepth != 0) Runtime.trap("timer job requires an empty computation stack");
           let ticket = enterComputation(owner, #host);
           ignore job();
@@ -564,9 +605,11 @@ module {
        }}
     };
     public func computationRetirementContext() : {self : Ref; caller : Caller; retire : () -> ()} {
+      materialize();
       let ?(ticket, context, _) = computationFrame else Runtime.trap("no executing computation actor");
-      {self=context.self; caller=context.caller;
+      {self=context.self; caller=callerOf(context.origin);
        retire=func () {
+        materialize();
         let ?(active, current, parent) = computationFrame else Runtime.trap("no executing computation actor");
         if(active != ticket or current.self != context.self)
           Runtime.trap("retirement requires its current computation invocation");
@@ -583,7 +626,42 @@ module {
         retire(current.self)
        }}
     };
+    var messageCaller : ?(() -> Principal) = null;
+    /// Installed once by the generated container: how a `#message` frame learns its caller.
+    public func installMessageCaller(read : () -> Principal) { messageCaller := ?read };
+    func callerOf(origin : Origin) : Caller = switch origin {
+      case (#known caller) caller;
+      case (#message) {
+        let ?read = messageCaller else Runtime.trap("message caller is unavailable in this container");
+        #external(read())
+      }
+    };
+    /// M7/O3b: frame recovery without a per-call `finally`. Measured (actor-pgc rung): the
+    /// try/finally that popped the frame on every path cost ~7.9k instructions and ~240 B per
+    /// call -- more than the callee's own work. Now a caught error is unwound where control
+    /// resumes: every `catch`/`finally` handler lowered inside the container unwinds to the mark
+    /// it took at `try` entry, and a call site's guard abandons its own invocation when an error
+    /// passes through it. Frames strictly above a mark can only belong to invocations that ended
+    /// by an error (a normal return leaves in order), so popping them is exact.
+    public func markComputation() : Nat { materialize(); switch computationFrame { case (?(ticket, _, _)) ticket; case null 0 } };
+    public func unwindComputation(mark : Nat) {
+      materialize();
+      label pop loop switch computationFrame {
+        case (?(ticket, _, parent)) { if (ticket <= mark) break pop; computationFrame := parent; computationDepth -= 1 };
+        case null break pop
+      }
+    };
+    /// Abandon the invocation entered with `ticket` and whatever it left behind. Tolerant of an
+    /// already-unwound frame (a handler inside the invocation may have unwound first).
+    public func abandonComputation(ticket : Nat) {
+      materialize();
+      label pop loop switch computationFrame {
+        case (?(active, _, parent)) { if (active < ticket) break pop; computationFrame := parent; computationDepth -= 1 };
+        case null break pop
+      }
+    };
     public func leaveComputation(ticket : Nat) {
+      materialize();
       switch computationFrame {
         case (?(current, _, parent)) {
           if (ticket != current) Runtime.trap("computation frame exit out of order");
