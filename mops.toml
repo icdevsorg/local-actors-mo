@@ -2,7 +2,9 @@
 name = "mo-local-actors"
 version = "0.0.1"
 description = "Experimental local-actor compiler target and runtime protocol."
+repository = "https://github.com/rivvirtech/moxzi"
 license = "Apache-2.0"
+keywords = ["motoko", "compiler", "actors"]
 
 [dependencies]
 core = "2.5.0"
