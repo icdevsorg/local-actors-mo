@@ -13,6 +13,6 @@ core = "2.5.0"
 # it: a consumer's `moxzi build` reads these and adds --experimental-local-actors itself.
 # Persistence is NOT required here -- Actor.id works on transient instances too; a library
 # that holds instances in stable state declares local-actor-persistence as well.
-[requirements]
-moxzi = ">=0.1.0-alpha.6"
-moxzi-features = "local-actors"
+[moxzi]
+version = ">=0.1.0-alpha.6"
+features = ["local-actors"]

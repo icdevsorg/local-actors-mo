@@ -22,7 +22,7 @@ most programs need. Everything else in this package (`Kernel`, `Jobs`, `Wire`, �
 compiler-facing side and is documented below for people working on the runtime.
 
 Requires moxzi (`moc` cannot compile `actor*`). This package declares that in its
-`mops.toml` — `[requirements] moxzi-features = "local-actors"` — so `moxzi build` in a
+`mops.toml` — `[moxzi] features = ["local-actors"]` — so `moxzi build` in a
 consuming project adds `--experimental-local-actors` itself and says so. Hold instances in
 stable state and you also need `--experimental-local-actor-persistence`; a library that
 does so declares `local-actor-persistence` too. Details: `docs/mops-requirements.md` in
