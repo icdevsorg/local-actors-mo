@@ -12,7 +12,7 @@ persistent actor Main {
     var value = initial;
     public func add(n : Nat) : async* Nat { value += n; value };
   };
-  var counter = Counter(0);
+  transient var counter = Counter(0);   // stable would need local-actor-persistence
   public func whoami() : async Principal { Actor.id(counter) };   // a principal you can hand out
 };
 ```
