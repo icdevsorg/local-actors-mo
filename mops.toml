@@ -1,10 +1,18 @@
 [package]
-name = "mo-local-actors"
-version = "0.0.1"
-description = "Experimental local-actor compiler target and runtime protocol."
+name = "local-actors"
+version = "0.1.0-alpha.7"
+description = "Helpers for moxzi actor* instances: Actor.id and addresses. The runtime itself is compiler-injected; this package is the small public surface beside it."
 repository = "https://github.com/rivvirtech/moxzi"
 license = "Apache-2.0"
-keywords = ["motoko", "compiler", "actors"]
+keywords = ["motoko", "moxzi", "actors", "actor-star"]
 
 [dependencies]
 core = "2.5.0"
+
+# The first package to use the convention in docs/mops-requirements.md, and the dogfood for
+# it: a consumer's `moxzi build` reads these and adds --experimental-local-actors itself.
+# Persistence is NOT required here -- Actor.id works on transient instances too; a library
+# that holds instances in stable state declares local-actor-persistence as well.
+[requirements]
+moxzi = ">=0.1.0-alpha.6"
+moxzi-features = "local-actors"

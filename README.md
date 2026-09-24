@@ -1,3 +1,35 @@
+# local-actors
+
+The small public surface beside moxzi's `actor*` feature. The runtime that makes `actor*`
+work is injected by the compiler (`moxzi:compiler-runtime`); you never import it. What
+you *do* import is this:
+
+```motoko
+import Actor "mo:local-actors/Actor";
+
+persistent actor Main {
+  actor* class Counter(initial : Nat) {
+    var value = initial;
+    public func add(n : Nat) : async* Nat { value += n; value };
+  };
+  var counter = Counter(0);
+  public func whoami() : async Principal { Actor.id(counter) };   // a principal you can hand out
+};
+```
+
+`Actor.id`, `Actor.container`, `Actor.address` and `Actor.fromAddress` are the whole API
+most programs need. Everything else in this package (`Kernel`, `Jobs`, `Wire`, …) is the
+compiler-facing side and is documented below for people working on the runtime.
+
+Requires moxzi (`moc` cannot compile `actor*`). This package declares that in its
+`mops.toml` — `[requirements] moxzi-features = "local-actors"` — so `moxzi build` in a
+consuming project adds `--experimental-local-actors` itself and says so. Hold instances in
+stable state and you also need `--experimental-local-actor-persistence`; a library that
+does so declares `local-actor-persistence` too. Details: `docs/mops-requirements.md` in
+the moxzi repository.
+
+---
+
 # Experimental local-actor compiler target
 
 `Kernel.mo` holds private Motoko object roots, generation-checked local references,
