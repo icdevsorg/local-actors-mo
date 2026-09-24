@@ -2,7 +2,7 @@
 name = "local-actors"
 version = "0.1.0-alpha.7"
 description = "Helpers for moxzi actor* instances: Actor.id and addresses. The runtime itself is compiler-injected; this package is the small public surface beside it."
-repository = "https://github.com/rivvirtech/moxzi"
+repository = "https://github.com/icdevsorg/local-actors-mo"
 license = "Apache-2.0"
 keywords = ["motoko", "moxzi", "actors", "actor-star"]
 
